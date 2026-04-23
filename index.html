@@ -1,0 +1,358 @@
+!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Macro Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;600;700;800;900&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0a0a0a; color: #fff; }
+  textarea:focus { outline: none; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+const API_KEY = "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";
+
+const STORAGE_KEY = "macro_tracker_v1";
+function loadData() { try { const r = localStorage.getItem(STORAGE_KEY); return r ? JSON.parse(r) : {}; } catch { return {}; } }
+function saveData(d) { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(d)); } catch {} }
+function getTodayKey() { return new Date().toISOString().slice(0, 10); }
+function formatDate(k) { const [y,m,d] = k.split("-"); return `${d}/${m}/${y}`; }
+
+async function analyzeFood(transcript) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "x-api-key": API_KEY,
+      "anthropic-version": "2023-06-01",
+      "anthropic-dangerous-direct-browser-access": "true"
+    },
+    body: JSON.stringify({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1000,
+      system: `Você é um nutricionista. O usuário vai descrever o que comeu em português, às vezes com erros de pronúncia ou nomes incorretos de marcas.
+
+REGRAS IMPORTANTES:
+- SEMPRE tente identificar o alimento mesmo com erros de pronúncia ou nome de marca errado
+- "optim-unutrition", "optimum nutrition", "ON" = marca de whey protein, trate como whey protein
+- "scoop de whey" = 1 dose de whey protein (30g) = ~120kcal, 24g proteína, 3g carbo, 2g gordura
+- Se o usuário falar quantidade vaga, use porção padrão
+- NUNCA retorne items vazio se houver qualquer menção a alimento, suplemento ou bebida
+
+Retorne APENAS JSON válido sem markdown:
+{"items":[{"nome":"nome do alimento com quantidade","calorias":número,"proteinas":número,"carboidratos":número,"gorduras":número}],"resumo":"frase curta confirmando o que foi registrado"}`,
+      messages: [{ role: "user", content: `Registrar: "${transcript}"` }]
+    })
+  });
+  const data = await res.json();
+  const text = data.content?.find(b => b.type === "text")?.text || "{}";
+  return JSON.parse(text.replace(/```json|```/g, "").trim());
+}
+
+function MacroBar({ label, value, max, color }) {
+  const pct = Math.min((value / max) * 100, 100);
+  return (
+    <div style={{marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+        <span style={{fontSize:11,fontFamily:"'Space Mono',monospace",color:"#888",textTransform:"uppercase",letterSpacing:1}}>{label}</span>
+        <span style={{fontSize:13,fontFamily:"'Space Mono',monospace",color:"#fff",fontWeight:700}}>{Math.round(value)}<span style={{color:"#555",fontWeight:400}}>g</span></span>
+      </div>
+      <div style={{height:6,background:"#1a1a1a",borderRadius:3,overflow:"hidden"}}>
+        <div style={{height:"100%",width:`${pct}%`,background:color,borderRadius:3,transition:"width 0.6s ease"}} />
+      </div>
+    </div>
+  );
+}
+
+function App() {
+  const [allData, setAllData] = useState(loadData);
+  const [view, setView] = useState("today");
+  const [histDay, setHistDay] = useState(null);
+  const [recording, setRecording] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [editText, setEditText] = useState("");
+  const [pendingText, setPendingText] = useState(null); // texto aguardando confirmação
+  const [feedback, setFeedback] = useState(null);
+  const [pulse, setPulse] = useState(1);
+  const recRef = useRef(null);
+  const pulseRef = useRef(null);
+
+  const todayKey = getTodayKey();
+  const todayData = allData[todayKey] || { items: [] };
+
+  const totals = (items) => items.reduce((a,it) => ({
+    cal: a.cal+(it.calorias||0), pro: a.pro+(it.proteinas||0),
+    carb: a.carb+(it.carboidratos||0), fat: a.fat+(it.gorduras||0)
+  }), {cal:0,pro:0,carb:0,fat:0});
+
+  const todayTotals = totals(todayData.items);
+
+  useEffect(() => { saveData(allData); }, [allData]);
+
+  useEffect(() => {
+    if (recording) {
+      let dir=1, val=1;
+      pulseRef.current = setInterval(() => {
+        val += dir*0.04; if(val>1.2||val<0.85) dir*=-1; setPulse(val);
+      }, 40);
+    } else { clearInterval(pulseRef.current); setPulse(1); }
+    return () => clearInterval(pulseRef.current);
+  }, [recording]);
+
+  const startRecording = useCallback(() => {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) { setFeedback({type:"error",msg:"Use o Chrome."}); return; }
+    const rec = new SR();
+    rec.lang = "pt-BR"; rec.interimResults = false; rec.maxAlternatives = 1;
+    recRef.current = rec;
+    rec.start();
+    setRecording(true); setFeedback(null); setTranscript(""); setPendingText(null);
+    rec.onresult = (e) => {
+      const t = e.results[0][0].transcript;
+      setTranscript(t);
+      setEditText(t);
+      setPendingText(t);
+    };
+    rec.onerror = (e) => { setRecording(false); setFeedback({type:"error",msg:"Erro: "+e.error}); };
+    rec.onend = () => setRecording(false);
+  }, []);
+
+  const stopRecording = useCallback(() => { recRef.current?.stop(); setRecording(false); }, []);
+
+  const submitFood = async (text) => {
+    if (!text.trim()) return;
+    setLoading(true); setFeedback(null); setPendingText(null);
+    try {
+      const result = await analyzeFood(text);
+      if (!result.items?.length) {
+        setFeedback({type:"error",msg:result.resumo||"Não identificado. Tente de novo."});
+      } else {
+        setAllData(prev => {
+          const existing = prev[todayKey]||{items:[]};
+          return {...prev,[todayKey]:{items:[...existing.items,...result.items]}};
+        });
+        setFeedback({type:"ok",msg:result.resumo});
+        setTranscript(""); setEditText("");
+      }
+    } catch(e) { setFeedback({type:"error",msg:"Erro ao analisar. Tente de novo."}); }
+    finally { setLoading(false); }
+  };
+
+  const removeItem = (dayKey, idx) => {
+    setAllData(prev => {
+      const items = [...(prev[dayKey]?.items||[])];
+      items.splice(idx,1);
+      return {...prev,[dayKey]:{items}};
+    });
+  };
+
+  const historyKeys = Object.keys(allData).sort().reverse();
+
+  const macro = (c) => ({
+    fontSize:11, fontFamily:"'Space Mono',monospace", color:c,
+    background:c+"22", borderRadius:4, padding:"2px 7px"
+  });
+
+  const btnBase = {
+    border:"none", cursor:"pointer", borderRadius:8,
+    fontFamily:"'DM Sans',sans-serif", fontWeight:700, fontSize:13,
+    padding:"10px 0", flex:1, transition:"all 0.2s"
+  };
+
+  const renderToday = () => (
+    <div style={{width:"100%",maxWidth:440,padding:"0 16px"}}>
+      {/* Summary */}
+      <div style={{background:"#111",borderRadius:16,padding:"20px 20px 16px",marginBottom:16}}>
+        <div style={{fontSize:50,fontWeight:900,letterSpacing:-2,lineHeight:1}}>{Math.round(todayTotals.cal)}</div>
+        <div style={{fontSize:11,color:"#444",fontFamily:"'Space Mono',monospace",letterSpacing:2,textTransform:"uppercase",marginTop:2,marginBottom:20}}>kcal hoje</div>
+        <MacroBar label="Proteína" value={todayTotals.pro} max={200} color="#4ade80"/>
+        <MacroBar label="Carbo" value={todayTotals.carb} max={300} color="#60a5fa"/>
+        <MacroBar label="Gordura" value={todayTotals.fat} max={100} color="#fb923c"/>
+      </div>
+
+      {/* Mic */}
+      <div style={{display:"flex",flexDirection:"column",alignItems:"center",margin:"8px 0 4px"}}>
+        <button
+          onClick={recording ? stopRecording : startRecording}
+          disabled={loading}
+          style={{
+            width:80,height:80,borderRadius:"50%",border:"none",cursor:loading?"not-allowed":"pointer",
+            background:loading?"#1a1a1a":recording?"#ff3b3b":"#fff",
+            display:"flex",alignItems:"center",justifyContent:"center",fontSize:32,
+            transform:`scale(${pulse})`,transition:"background 0.3s",
+            boxShadow:recording?"0 0 40px #ff3b3b55":"0 0 20px #ffffff15"
+          }}
+        >
+          {loading ? "⏳" : recording ? "⏹" : "🎙"}
+        </button>
+        <div style={{fontSize:11,color:"#444",marginTop:10,fontFamily:"'Space Mono',monospace",letterSpacing:1,textAlign:"center"}}>
+          {loading?"analisando...":recording?"gravando... toque para parar":"toque para falar o que comeu"}
+        </div>
+      </div>
+
+      {/* Edit + confirm area — aparece após reconhecimento */}
+      {pendingText && !loading && (
+        <div style={{background:"#111",borderRadius:12,padding:"14px",marginTop:12}}>
+          <div style={{fontSize:10,color:"#555",fontFamily:"'Space Mono',monospace",letterSpacing:1,textTransform:"uppercase",marginBottom:8}}>
+            reconheceu — corrija se precisar:
+          </div>
+          <textarea
+            value={editText}
+            onChange={e => setEditText(e.target.value)}
+            rows={2}
+            style={{
+              width:"100%", background:"#1a1a1a", border:"1px solid #2a2a2a",
+              borderRadius:8, padding:"10px 12px", fontSize:14, color:"#fff",
+              fontFamily:"'DM Sans',sans-serif", resize:"none", lineHeight:1.5
+            }}
+          />
+          <div style={{display:"flex",gap:8,marginTop:10}}>
+            <button
+              onClick={() => { setPendingText(null); setTranscript(""); setEditText(""); }}
+              style={{...btnBase, background:"#1a1a1a", color:"#666"}}
+            >Cancelar</button>
+            <button
+              onClick={() => submitFood(editText)}
+              style={{...btnBase, background:"#fff", color:"#0a0a0a", flex:2}}
+            >✓ Confirmar</button>
+          </div>
+        </div>
+      )}
+
+      {/* Feedback */}
+      {feedback && !pendingText && (
+        <div style={{
+          background:feedback.type==="ok"?"#0d2b1a":"#2b0d0d",
+          border:`1px solid ${feedback.type==="ok"?"#1a5c33":"#5c1a1a"}`,
+          borderRadius:10,padding:"10px 14px",fontSize:13,
+          color:feedback.type==="ok"?"#4ade80":"#f87171",
+          marginTop:12,width:"100%"
+        }}>{feedback.msg}</div>
+      )}
+
+      {/* Food list */}
+      <div style={{fontSize:11,color:"#444",fontFamily:"'Space Mono',monospace",letterSpacing:2,textTransform:"uppercase",marginBottom:10,marginTop:20}}>— registros de hoje</div>
+      {todayData.items.length === 0
+        ? <div style={{textAlign:"center",color:"#333",fontSize:13,fontFamily:"'Space Mono',monospace",marginTop:30,lineHeight:2}}>nenhum alimento<br/>registrado ainda</div>
+        : [...todayData.items].reverse().map((it, i) => {
+          const realIdx = todayData.items.length-1-i;
+          return (
+            <div key={i} style={{background:"#111",borderRadius:12,padding:"12px 14px",marginBottom:8,display:"flex",alignItems:"flex-start",gap:10}}>
+              <div style={{flex:1}}>
+                <div style={{fontSize:14,fontWeight:600,marginBottom:6}}>{it.nome}</div>
+                <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                  <span style={macro("#f9a825")}>{Math.round(it.calorias)} kcal</span>
+                  <span style={macro("#4ade80")}>{Math.round(it.proteinas)}g P</span>
+                  <span style={macro("#60a5fa")}>{Math.round(it.carboidratos)}g C</span>
+                  <span style={macro("#fb923c")}>{Math.round(it.gorduras)}g G</span>
+                </div>
+              </div>
+              <button onClick={() => removeItem(todayKey, realIdx)} style={{background:"none",border:"none",color:"#444",cursor:"pointer",fontSize:18,padding:2,lineHeight:1}}>✕</button>
+            </div>
+          );
+        })
+      }
+    </div>
+  );
+
+  const renderHistory = () => {
+    if (histDay) {
+      const d = allData[histDay]||{items:[]};
+      const t = totals(d.items);
+      return (
+        <div style={{width:"100%",maxWidth:440,padding:"0 16px"}}>
+          <button onClick={() => setHistDay(null)} style={{background:"none",border:"none",color:"#555",cursor:"pointer",fontFamily:"'Space Mono',monospace",fontSize:11,padding:0,marginBottom:16,letterSpacing:1}}>← VOLTAR</button>
+          <div style={{background:"#111",borderRadius:16,padding:"20px 20px 16px",marginBottom:16}}>
+            <div style={{fontSize:12,color:"#555",fontFamily:"'Space Mono',monospace",marginBottom:8}}>{formatDate(histDay)}</div>
+            <div style={{fontSize:50,fontWeight:900,letterSpacing:-2,lineHeight:1}}>{Math.round(t.cal)}</div>
+            <div style={{fontSize:11,color:"#444",fontFamily:"'Space Mono',monospace",letterSpacing:2,textTransform:"uppercase",marginTop:2,marginBottom:20}}>kcal</div>
+            <MacroBar label="Proteína" value={t.pro} max={200} color="#4ade80"/>
+            <MacroBar label="Carbo" value={t.carb} max={300} color="#60a5fa"/>
+            <MacroBar label="Gordura" value={t.fat} max={100} color="#fb923c"/>
+          </div>
+          {d.items.map((it,i) => (
+            <div key={i} style={{background:"#111",borderRadius:12,padding:"12px 14px",marginBottom:8}}>
+              <div style={{fontSize:14,fontWeight:600,marginBottom:6}}>{it.nome}</div>
+              <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+                <span style={macro("#f9a825")}>{Math.round(it.calorias)} kcal</span>
+                <span style={macro("#4ade80")}>{Math.round(it.proteinas)}g P</span>
+                <span style={macro("#60a5fa")}>{Math.round(it.carboidratos)}g C</span>
+                <span style={macro("#fb923c")}>{Math.round(it.gorduras)}g G</span>
+              </div>
+            </div>
+          ))}
+        </div>
+      );
+    }
+
+    return (
+      <div style={{width:"100%",maxWidth:440,padding:"0 16px"}}>
+        <div style={{fontSize:11,color:"#444",fontFamily:"'Space Mono',monospace",letterSpacing:2,textTransform:"uppercase",marginBottom:10}}>— histórico</div>
+        {historyKeys.length === 0
+          ? <div style={{textAlign:"center",color:"#333",fontSize:13,fontFamily:"'Space Mono',monospace",marginTop:30,lineHeight:2}}>nenhum histórico<br/>ainda</div>
+          : historyKeys.map(key => {
+            const d = allData[key]||{items:[]};
+            const t = totals(d.items);
+            const isToday = key === todayKey;
+            return (
+              <div key={key} onClick={() => setHistDay(key)} style={{background:"#111",borderRadius:12,padding:"14px 16px",marginBottom:8,cursor:"pointer",border:`1px solid ${isToday?"#333":"transparent"}`}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:700}}>{isToday?"hoje":formatDate(key)}</div>
+                    <div style={{fontSize:11,color:"#555",fontFamily:"'Space Mono',monospace",marginTop:3}}>{d.items.length} item{d.items.length!==1?"s":""}</div>
+                  </div>
+                  <div style={{textAlign:"right"}}>
+                    <div style={{fontSize:22,fontWeight:900,letterSpacing:-1}}>{Math.round(t.cal)}</div>
+                    <div style={{fontSize:10,color:"#444",fontFamily:"'Space Mono',monospace"}}>kcal</div>
+                  </div>
+                </div>
+                <div style={{display:"flex",gap:6,marginTop:10,flexWrap:"wrap"}}>
+                  <span style={macro("#4ade80")}>{Math.round(t.pro)}g P</span>
+                  <span style={macro("#60a5fa")}>{Math.round(t.carb)}g C</span>
+                  <span style={macro("#fb923c")}>{Math.round(t.fat)}g G</span>
+                </div>
+              </div>
+            );
+          })
+        }
+      </div>
+    );
+  };
+
+  return (
+    <div style={{minHeight:"100vh",background:"#0a0a0a",color:"#fff",fontFamily:"'DM Sans',sans-serif",display:"flex",flexDirection:"column",alignItems:"center",paddingBottom:80}}>
+      <div style={{width:"100%",maxWidth:440,padding:"32px 16px 0"}}>
+        <h1 style={{fontSize:28,fontWeight:900,letterSpacing:-1,lineHeight:1.1}}>MACRO<br/>TRACKER</h1>
+        <div style={{fontSize:11,color:"#555",marginTop:4,fontFamily:"'Space Mono',monospace",letterSpacing:1,textTransform:"uppercase"}}>{formatDate(todayKey)}</div>
+        <div style={{display:"flex",gap:4,marginTop:20,background:"#111",borderRadius:10,padding:4}}>
+          {["today","history"].map(v => (
+            <button key={v} onClick={() => {setView(v);setHistDay(null);}} style={{
+              flex:1,padding:"8px 0",borderRadius:7,border:"none",cursor:"pointer",
+              fontFamily:"'DM Sans',sans-serif",fontWeight:600,fontSize:13,
+              background:view===v?"#fff":"transparent",color:view===v?"#0a0a0a":"#555",transition:"all 0.2s"
+            }}>{v==="today"?"Hoje":"Histórico"}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{width:"100%",display:"flex",flexDirection:"column",alignItems:"center",marginTop:20}}>
+        {view==="today" ? renderToday() : renderHistory()}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
